@@ -17,7 +17,7 @@ from utils.tools import create_directory
 from utils.transformer_tools import fit_transformer
 
 module = "RegressionExperiment"
-data_path = "data/"
+data_path = "C:/Users/changt/workspace/Dataset/TS_Regression/"
 problem = "FloodModeling1"
  # see data_loader.regression_datasets
 regressor_name = "mcnn"  # see regressor_tools.all_models
@@ -128,7 +128,10 @@ if __name__ == '__main__':
     regressor = fit_regressor(output_directory, regressor_name, x_train, y_train, x_test, y_test, itr=itr)
 
     # start testing
-    y_pred = regressor.predict(x_test)
+    if regressor_name.lower() == "mcnn":
+        y_pred = regressor.predict(x_test, x_train, y_train, y_test)
+    else:
+        y_pred = regressor.predict(x_test)
     df_metrics = calculate_regression_metrics(y_test, y_pred)
 
     print(df_metrics)

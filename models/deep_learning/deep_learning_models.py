@@ -54,8 +54,8 @@ class DLRegressor(TimeSeriesRegressor):
             epochs=200,
             batch_size=16,
             loss="mean_squared_error",
-
-            metrics=None
+            metrics=None,
+            build_model=True,
     ):
         """
         Initialise the DL model
@@ -87,8 +87,10 @@ class DLRegressor(TimeSeriesRegressor):
             metrics = ["mae"]
         self.metrics = metrics
 
-        # self.model = self.build_model(input_shape)
-        self.model = None
+        if build_model:
+            self.model = self.build_model(input_shape)
+        else:
+            self.model = None
         if self.model is not None:
             self.model.summary()
             self.model.save_weights(self.output_directory + self.model_init_file)
@@ -174,7 +176,7 @@ class DLRegressor(TimeSeriesRegressor):
                                metric=m,
                                model=self.name)
 
-    def predict(self, x):
+    def predict(self, x_test, x_train=None, y_train=None, y_test=None):
         """
         Do prediction with DL models
 
@@ -186,7 +188,7 @@ class DLRegressor(TimeSeriesRegressor):
         print('[{}] Predicting'.format(self.name))
         start_time = time.perf_counter()
         model = tf.keras.models.load_model(self.output_directory + self.best_model_file)
-        yhat = model.predict(x)
+        yhat = model.predict(x_test)
 
         tf.keras.backend.clear_session()
         test_duration = time.perf_counter() - start_time

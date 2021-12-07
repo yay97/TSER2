@@ -1,11 +1,17 @@
 # MCNN model
 
-import tensorflow as tf
-import tensorflow.keras as keras
-import numpy as np
 import time
 
+import numpy as np
+import tensorflow as tf
+import tensorflow.keras as keras
+from sklearn.metrics import mean_squared_error
+from tqdm import tqdm
+
 from models.deep_learning.deep_learning_models import DLRegressor
+from utils.regressor_tools import calculate_regression_metrics
+from utils.tools import create_directory
+
 
 class MCNNRegressor(DLRegressor):
     def __init__(
@@ -14,14 +20,13 @@ class MCNNRegressor(DLRegressor):
             input_shape,
             verbose=False,
             batch_size=64,
-            epochs=1500,
+            epochs=200,
             loss="mean_squared_error",
-             # used for hyperparameters grid search
-            # pool_factors=[2, 3, 5],
-            filter_sizes =[0.05,0.1,0.2],
-             # used for hyperparameters grid search
+            # used for hyperparameters grid search
+            pool_factors=[2, 3, 5],
+            filter_sizes=[0.05, 0.1, 0.2],
+            # used for hyperparameters grid search
             metrics=None
-
     ):
         self.name = "mcnn"
         super().__init__(
@@ -31,14 +36,212 @@ class MCNNRegressor(DLRegressor):
             epochs=epochs,
             batch_size=batch_size,
             loss=loss,
-            metrics=metrics
-
+            metrics=metrics,
+            build_model=False,
         )
 
-    def train(self, x_train, y_train, x_test, y_test, y_true, pool_factor=None, filter_size=None, do_train=True):
+        self.pool_factors = pool_factors
+        self.filter_sizes = filter_sizes
+
+        self.pool_factor = None
+        self.kernel_size = None
+
+    def slice_data(self, data_x, data_y, slice_ratio):
+        n = data_x.shape[0]
+        length = data_x.shape[1]
+        n_dim = data_x.shape[2]  # for MTS
+
+        length_sliced = int(length * slice_ratio)
+
+        increase_num = length - length_sliced + 1  # if increase_num =5, it means one ori becomes 5 new instances.
+        n_sliced = n * increase_num
+
+        new_x = np.zeros((n_sliced, length_sliced, n_dim))
+        new_y = np.zeros((n_sliced,))
+        for i in range(n):
+            for j in range(increase_num):
+                new_x[i * increase_num + j, :, :] = data_x[i, j: j + length_sliced, :]
+                new_y[i * increase_num + j] = np.int_(data_y[i].astype(np.float32))
+
+        return new_x, new_y
+
+    def split_train(self, train_x, train_y):
+        # shuffle for splitting train set and dataset
+        n = train_x.shape[0]
+        ind = np.arange(n)
+        np.random.shuffle(ind)  # shuffle the train set
+
+        # split train set into train set and validation set
+        valid_x = train_x[ind[0:int(0.2 * n)]]
+        valid_y = train_y[ind[0:int(0.2 * n)]]
+
+        ind = np.delete(ind, (range(0, int(0.2 * n))))
+
+        train_x = train_x[ind]
+        train_y = train_y[ind]
+
+        return train_x, train_y, valid_x, valid_y
+
+    def _downsample(self, data_x, sample_rate, offset=0):
+        num = data_x.shape[0]
+        length_x = data_x.shape[1]
+        num_dim = data_x.shape[2]  # for MTS
+        last_one = 0
+        if length_x % sample_rate > offset:
+            last_one = 1
+        new_length = int(np.floor(length_x / sample_rate)) + last_one
+        output = np.zeros((num, new_length, num_dim))
+        for i in range(new_length):
+            output[:, i] = np.array(data_x[:, offset + sample_rate * i])
+
+        return output
+
+    def _movingavrg(self, data_x, window_size):
+        num = data_x.shape[0]
+        length_x = data_x.shape[1]
+        num_dim = data_x.shape[2]  # for MTS
+        output_len = length_x - window_size + 1
+        output = np.zeros((num, output_len, num_dim))
+        for i in range(output_len):
+            output[:, i] = np.mean(data_x[:, i: i + window_size], axis=1)
+        return output
+
+    def movingavrg(self, data_x, window_base, step_size, num):
+        if num == 0:
+            return (None, [])
+        out = self._movingavrg(data_x, window_base)
+        data_lengths = [out.shape[1]]
+        for i in range(1, num):
+            window_size = window_base + step_size * i
+            if window_size > data_x.shape[1]:
+                continue
+            new_series = self._movingavrg(data_x, window_size)
+            data_lengths.append(new_series.shape[1])
+            out = np.concatenate([out, new_series], axis=1)
+        return (out, data_lengths)
+
+    def batch_movingavrg(self, train, valid, test, window_base, step_size, num):
+        (new_train, lengths) = self.movingavrg(train, window_base, step_size, num)
+        (new_valid, lengths) = self.movingavrg(valid, window_base, step_size, num)
+        (new_test, lengths) = self.movingavrg(test, window_base, step_size, num)
+        return (new_train, new_valid, new_test, lengths)
+
+    def downsample(self, data_x, base, step_size, num):
+        # the case for dataset JapaneseVowels MTS
+        if data_x.shape[1] == 26:
+            return (None, [])  # too short to apply downsampling
+        if num == 0:
+            return (None, [])
+        out = self._downsample(data_x, base, 0)
+        data_lengths = [out.shape[1]]
+        # for offset in range(1,base): #for the base case
+        #    new_series = _downsample(data_x, base, offset)
+        #    data_lengths.append( new_series.shape[1] )
+        #    out = np.concatenate( [out, new_series], axis = 1)
+        for i in range(1, num):
+            sample_rate = base + step_size * i
+            if sample_rate > data_x.shape[1]:
+                continue
+            for offset in range(0, 1):  # sample_rate):
+                new_series = self._downsample(data_x, sample_rate, offset)
+                data_lengths.append(new_series.shape[1])
+                out = np.concatenate([out, new_series], axis=1)
+        return (out, data_lengths)
+
+    def batch_downsample(self, train, valid, test, window_base, step_size, num):
+        (new_train, lengths) = self.downsample(train, window_base, step_size, num)
+        (new_valid, lengths) = self.downsample(valid, window_base, step_size, num)
+        (new_test, lengths) = self.downsample(test, window_base, step_size, num)
+        return (new_train, new_valid, new_test, lengths)
+
+    def get_pool_factor(self, conv_shape, pool_size):
+        for pool_factor in self.pool_factors:
+            temp_pool_size = int(int(conv_shape) / pool_factor)
+            # print(temp_pool_size)
+            if temp_pool_size == pool_size:
+                return pool_factor
+
+        raise Exception('Error on pool factor')
+
+    def split_input_for_model(self, x, input_shapes):
+        res = []
+        indx = 0
+        for input_shape in input_shapes:
+            res.append(x[:, indx:indx + input_shape[0], :])
+            indx = indx + input_shape[0]
+        return res
+
+    def get_list_of_input_shapes(self, data_lengths, num_dim):
+        input_shapes = []
+        max_length = 0
+        for i in data_lengths:
+            input_shapes.append((i, num_dim))
+            max_length = max(max_length, i)
+        return input_shapes, max_length
+
+    def build_model(self, input_shape):
+        input_layers = []
+        stage_1_layers = []
+
+        for input_shape1 in input_shape:
+            input_layer = tf.keras.layers.Input(input_shape1)
+
+            input_layers.append(input_layer)
+
+            conv_layer = tf.keras.layers.Conv1D(
+                filters=256,
+                kernel_size=self.kernel_size,
+                padding='same',
+                activation='sigmoid',
+                kernel_initializer='glorot_uniform'
+            )(input_layer)
+
+            # should all concatenated have the same length
+            pool_size = int(int(conv_layer.shape[1]) / self.pool_factor)
+
+            max_layer = keras.layers.MaxPooling1D(pool_size=pool_size)(conv_layer)
+
+            # max_layer = keras.layers.GlobalMaxPooling1D()(conv_layer)
+
+            stage_1_layers.append(max_layer)
+
+        concat_layer = keras.layers.Concatenate(axis=-1)(stage_1_layers)
+
+        kernel_size = int(min(self.kernel_size, int(concat_layer.shape[1])))  # kernel shouldn't exceed the length
+
+        full_conv = keras.layers.Conv1D(filters=256, kernel_size=kernel_size, padding='same',
+                                        activation='sigmoid', kernel_initializer='glorot_uniform')(concat_layer)
+
+        pool_size = int(int(full_conv.shape[1]) / self.pool_factor)
+
+        full_max = keras.layers.MaxPooling1D(pool_size=pool_size)(full_conv)
+
+        full_max = keras.layers.Flatten()(full_max)
+
+        fully_connected = keras.layers.Dense(
+            units=256,
+            activation='sigmoid',
+            kernel_initializer='glorot_uniform'
+        )(full_max)
+
+        output_layer = keras.layers.Dense(units=1, activation='linear',
+                                          kernel_initializer='glorot_uniform')(fully_connected)
+
+        model = keras.models.Model(inputs=input_layers, outputs=output_layer)
+
+        model.compile(
+            loss=self.loss,
+            optimizer=keras.optimizers.Adam(learning_rate=0.1),
+            metrics=self.metrics,
+        )
+
+        return model
+
+    def train(self, x_train, y_train, x_test, y_test, pool_factor=None, filter_size=None, do_train=True):
         window_size = 0.2
         n_train_batch = 10
         n_epochs = 200
+        # n_epochs = 5 # testing
         max_train_batch_size = 256
 
         # print('Original train shape: ', x_train.shape)
@@ -49,9 +252,10 @@ class MCNNRegressor(DLRegressor):
 
         ori_len = x_train.shape[1]  # original_length of time series
         slice_ratio = 0.9
+        #slice_ratio = 1.0
 
         if do_train == True:
-            kernel_size = int(ori_len * filter_size)
+            self.kernel_size = int(ori_len * filter_size)
 
         if do_train == False:
             model = keras.models.load_model(self.output_directory + 'best_model.hdf5')
@@ -138,7 +342,6 @@ class MCNNRegressor(DLRegressor):
         n_train_batches = int(n_train_size / batch_size)
         data_dim = train_set_x.shape[1]
         num_dim = train_set_x.shape[2]  # For MTS
-        nb_classes = train_set_y.shape[1]
 
         # print('train size', n_train_size, ',valid size', n_valid_size, ' test size', n_test_size)
         # print('batch size ', batch_size)
@@ -159,8 +362,7 @@ class MCNNRegressor(DLRegressor):
 
         if do_train == True:
 
-            model = self.build_model(input_shapes,kernel_size)
-
+            model = self.build_model(input_shapes)
 
             if (self.verbose == True):
                 model.summary()
@@ -189,8 +391,10 @@ class MCNNRegressor(DLRegressor):
             epoch_avg_cost = float('inf')
             epoch_avg_err = float('inf')
 
-            while (epoch < n_epochs) and (not done_looping):
-                epoch = epoch + 1
+            for epoch in tqdm(range(n_epochs)):
+                if done_looping:
+                    break
+                # epoch = epoch + 1
                 epoch_train_err = 0.
                 epoch_cost = 0.
 
@@ -221,23 +425,9 @@ class MCNNRegressor(DLRegressor):
                             x = valid_set_x[i * (increase_num): (i + 1) * (increase_num)]
                             y_pred = model.predict_on_batch(self.split_input_for_model(x, input_shapes))
 
-                            # convert the predicted from binary to integer
-                            y_pred = np.argmax(y_pred, axis=1)
-                            label = np.argmax(valid_set_y[i * increase_num])
+                            label = valid_set_y[i * (increase_num): (i + 1) * (increase_num)]
 
-                            unique_value, sub_ind, correspond_ind, count = np.unique(y_pred, True, True, True)
-                            unique_value = unique_value.tolist()
-
-                            curr_err = 1.
-                            if label in unique_value:
-                                target_ind = unique_value.index(label)
-                                count = count.tolist()
-                                sorted_count = sorted(count)
-                                if count[target_ind] == sorted_count[-1]:
-                                    if len(sorted_count) > 1 and sorted_count[-1] == sorted_count[-2]:
-                                        curr_err = 0.5  # tie
-                                    else:
-                                        curr_err = 0
+                            curr_err = mean_squared_error(label, y_pred)
                             valid_losses.append(curr_err)
                         valid_loss = sum(valid_losses) / float(len(valid_losses))
 
@@ -282,13 +472,7 @@ class MCNNRegressor(DLRegressor):
             x = test_set_x[i * (increase_num): (i + 1) * (increase_num)]
             y_pred = model.predict_on_batch(self.split_input_for_model(x, input_shapes))
 
-            # convert the predicted from binary to integer
-            y_pred = np.argmax(y_pred, axis=1)
-
-            unique_value, sub_ind, correspond_ind, count = np.unique(y_pred, True, True, True)
-
-            idx_max = np.argmax(count)
-            predicted_label = unique_value[idx_max]
+            predicted_label = np.mean(y_pred)
 
             y_predicted.append(predicted_label)
 
@@ -296,82 +480,50 @@ class MCNNRegressor(DLRegressor):
 
         duration = time.time() - start_time
 
-        # df_metrics = calculate_metrics(y_true, y_pred, duration)
+        df_metrics = calculate_regression_metrics(y_test[::increase_num], y_pred)
 
         # print(y_true.shape)
         # print(y_pred.shape)
 
-       #  df_metrics.to_csv(self.output_directory + 'df_metrics.csv', index=False)
+        # df_metrics.to_csv(self.output_directory + 'df_metrics.csv', index=False)
 
-        return  model, best_validation_loss
+        return y_pred, df_metrics, model, best_validation_loss, duration
 
-    def split_input_for_model(self, x, input_shapes):
-        res = []
-        indx = 0
-        for input_shape in input_shapes:
-            res.append(x[:, indx:indx + input_shape[0], :])
-            indx = indx + input_shape[0]
-        return res
+    def fit(self, x_train, y_train, x_test=None, y_test=None, monitor_val=False):
+        if not tf.test.is_gpu_available:
+            print('error')
+            exit()
+        best_df_metrics = None
+        best_valid_loss = np.inf
 
-
-    def get_pool_factor(self, conv_shape, pool_size):
+        output_directory_root = self.output_directory
+        # grid search
+        self.train_duration = 0
         for pool_factor in self.pool_factors:
-            temp_pool_size = int(int(conv_shape) / pool_factor)
-            print(temp_pool_size)
-            if temp_pool_size == pool_size:
-                return pool_factor
+            self.pool_factor = pool_factor
+            for filter_size in self.filter_sizes:
+                self.output_directory = output_directory_root + '/hyper_param_search/' + '/pool_factor_' + \
+                                        str(pool_factor) + '/filter_size_' + str(filter_size) + '/'
+                create_directory(self.output_directory)
+                _, df_metrics, model, valid_loss, duration = self.train(
+                    x_train, y_train,
+                    x_test, y_test,
+                    pool_factor,
+                    filter_size
+                )
+                self.train_duration += duration
 
-        raise Exception('Error on pool factor')
+                if (valid_loss < best_valid_loss):
+                    best_valid_loss = valid_loss
+                    best_df_metrics = df_metrics
+                    best_df_metrics.to_csv(output_directory_root + 'df_metrics.csv', index=False)
+                    model.save(output_directory_root + 'best_model.hdf5')
 
+                model = None
+                # clear memeory
+                keras.backend.clear_session()
 
+    def predict(self, x_test, x_train=None, y_train=None, y_test=None):
+        y_pred, df_metrics, _, _, duration = self.train(x_train, y_train, x_test, y_test, do_train=False)
 
-
-
-    def build_model(self, input_shape, kernel_size):
-        input_layers = []
-        stage_1_layers = []
-
-
-        for input_shape1 in input_shape:
-            input_layer = tf.keras.layers.Input(input_shape1)
-
-            input_layers.append(input_layer)
-
-            conv_layer = tf.keras.layers.Conv1D(filters=256, kernel_size=kernel_size, padding='same',
-                                             activation='sigmoid', kernel_initializer='glorot_uniform')(input_layer)
-
-            # should all concatenated have the same length
-            #pool_size = int(int(conv_layer.shape[1]) / pool_factor)
-
-            #max_layer = tf.keras.layers.MaxPooling1D(pool_size=pool_size)(conv_layer)
-
-            max_layer = tf.keras.layers.GlobalMaxPooling1D()(conv_layer)
-
-            stage_1_layers.append(max_layer)
-
-        concat_layer = tf.keras.layers.Concatenate(axis=-1)(stage_1_layers)
-
-        kernel_size = int(min(1, int(concat_layer.shape[1])))  # kernel shouldn't exceed the length
-
-        full_conv = tf.keras.layers.Conv1D(filters=256, kernel_size=kernel_size, padding='same',
-                                        activation='sigmoid', kernel_initializer='glorot_uniform')(concat_layer)
-
-        #pool_size = int(int(full_conv.shape[1]) / pool_factor)
-
-        full_max = tf.keras.layers.GlobalMaxPooling1D()(full_conv)
-
-        full_max = tf.keras.layers.Flatten()(full_max)
-
-        fully_connected = tf.keras.layers.Dense(units=256, activation='sigmoid',
-                                             kernel_initializer='glorot_uniform')(full_max)
-
-        output_layer = tf.keras.layers.Dense(units=1, activation='linear',
-                                          kernel_initializer='glorot_uniform')(fully_connected)
-
-        model = tf.keras.models.Model(inputs=input_layers, outputs=output_layer)
-
-        model.compile(loss=self.loss, optimizer=keras.optimizers.Adam(lr=0.1),
-                      metrics=self.metrics)
-
-        return model
-
+        return y_pred
